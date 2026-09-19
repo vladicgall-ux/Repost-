@@ -6,3 +6,6 @@ config.json
 state.json
 *.tmp
 .env
+userbot_state.json
+*.session
+*.session-journal
