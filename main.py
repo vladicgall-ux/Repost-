@@ -45,6 +45,7 @@ from aiogram.types import (
     InputMediaPhoto,
     InputMediaVideo,
     Message,
+    MessageOriginChannel,
 )
 
 # --------------------------------------------------------------------------- #
@@ -62,6 +63,7 @@ MIN_INTERVAL = 15                            # чаще опрашивать t.m
 MAX_INTERVAL = 24 * 60 * 60
 
 DELAY_BETWEEN_POSTS = 3.0    # пауза между репостами, чтобы не поймать FloodWait
+ALBUM_WAIT = 2.0             # сколько ждём остальные части альбома в режиме live
 MAX_POSTS_PER_CYCLE = 10     # сколько постов максимум отправляем за один цикл
 MAX_MEDIA_SIZE = 45 * 1024 * 1024   # 45 МБ — лимит загрузки файла через Bot API
 
@@ -93,6 +95,9 @@ class Config:
     """Настройки бота, сериализуются в config.json."""
 
     source_channel: Optional[str] = None     # username канала-источника без @
+    source_chat_id: Optional[int] = None     # -100... источника (для приватных каналов)
+    source_title: Optional[str] = None       # человекочитаемое название источника
+    mode: str = "web"                        # "web" — парсинг t.me/s/, "live" — channel_post
     target_channel: Optional[str] = None     # @username или -100... целевого канала
     last_post_id: int = 0                    # последний реально скопированный пост
     interval: int = DEFAULT_INTERVAL         # период опроса в секундах
@@ -102,12 +107,26 @@ class Config:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "source_channel": self.source_channel,
+            "source_chat_id": self.source_chat_id,
+            "source_title": self.source_title,
+            "mode": self.mode,
             "target_channel": self.target_channel,
             "last_post_id": self.last_post_id,
             "interval": self.interval,
             "enabled": self.enabled,
             "owner_id": self.owner_id,
         }
+
+    @property
+    def source_label(self) -> str:
+        """Как показывать источник пользователю."""
+        if self.source_channel:
+            return f"@{self.source_channel}"
+        if self.source_title:
+            return f"{self.source_title} (<code>{self.source_chat_id}</code>)"
+        if self.source_chat_id:
+            return f"<code>{self.source_chat_id}</code>"
+        return "— не задан"
 
 
 def load_config() -> Config:
@@ -117,6 +136,9 @@ def load_config() -> Config:
             raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             cfg = Config(
                 source_channel=raw.get("source_channel"),
+                source_chat_id=raw.get("source_chat_id"),
+                source_title=raw.get("source_title"),
+                mode=raw.get("mode") or "web",
                 target_channel=raw.get("target_channel"),
                 last_post_id=int(raw.get("last_post_id") or 0),
                 interval=int(raw.get("interval") or DEFAULT_INTERVAL),
@@ -177,6 +199,14 @@ POST_LINK_RE = re.compile(
 CHANNEL_RE = re.compile(
     r"^(?:(?:https?://)?t(?:elegram)?\.me/(?:s/)?)?@?(?P<name>[A-Za-z0-9_]{4,32})/?$"
 )
+# приватный канал: https://t.me/c/1916432895/17544
+PRIVATE_POST_RE = re.compile(
+    r"(?:https?://)?t(?:elegram)?\.me/c/(?P<chat>\d+)/(?P<post>\d+)"
+)
+# ссылка-приглашение: https://t.me/+YZshvpW4VGgzZWQy или /joinchat/...
+INVITE_RE = re.compile(
+    r"(?:https?://)?t(?:elegram)?\.me/(?:\+|joinchat/)(?P<hash>[A-Za-z0-9_-]+)"
+)
 
 
 def parse_post_link(text: str) -> Optional[tuple[str, int]]:
@@ -185,6 +215,14 @@ def parse_post_link(text: str) -> Optional[tuple[str, int]]:
     if not m:
         return None
     return m.group("name"), int(m.group("post"))
+
+
+def parse_private_post_link(text: str) -> Optional[tuple[int, int]]:
+    """Из https://t.me/c/1916432895/17544 достаёт (-1001916432895, 17544)."""
+    m = PRIVATE_POST_RE.search(text.strip())
+    if not m:
+        return None
+    return int("-100" + m.group("chat")), int(m.group("post"))
 
 
 def parse_channel_ref(text: str) -> Optional[str]:
@@ -604,8 +642,10 @@ class Reposter:
             await asyncio.sleep(max(MIN_INTERVAL, self.cfg.interval))
 
     async def _check_once(self) -> None:
-        """Одна проверка канала-источника."""
+        """Одна проверка канала-источника (только для режима web)."""
         cfg = self.cfg
+        if cfg.mode != "web":
+            return
         if not (cfg.enabled and cfg.source_channel and cfg.target_channel):
             return
 
@@ -706,53 +746,191 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.set_state(Setup.waiting_source)
     await message.answer(
         "👋 <b>Привет!</b> Я копирую посты из чужого канала в твой.\n\n"
-        "<b>Шаг 1 из 2.</b> Пришли ссылку на любой пост канала-источника, например:\n"
-        "<code>https://t.me/durov/123</code>\n\n"
-        "Копировать буду посты, вышедшие <i>после</i> этого.\n"
-        "Канал должен быть публичным (доступен по адресу t.me/s/имя).\n\n"
+        "<b>Шаг 1 из 2.</b> Укажи канал-источник любым способом:\n\n"
+        "📤 <b>Перешли мне любой пост</b> из него — самый надёжный вариант, "
+        "работает и с приватными каналами;\n"
+        "🔗 или пришли ссылку на пост: <code>https://t.me/durov/123</code>\n\n"
+        "Копировать буду посты, вышедшие <i>после</i> указанного.\n\n"
         "Отмена — /stop"
     )
 
 
+async def _finish_source_step(
+    message: Message,
+    state: FSMContext,
+    *,
+    username: Optional[str],
+    chat_id: Optional[int],
+    title: Optional[str],
+    post_id: int,
+    mode: str,
+    note: str = "",
+) -> None:
+    """Сохраняет выбранный источник и переводит на шаг 2."""
+    config.source_channel = username
+    config.source_chat_id = chat_id
+    config.source_title = title
+    config.mode = mode
+    config.last_post_id = post_id
+    save_config(config)
+    if username:
+        set_last_seen(username, post_id)
+
+    await state.set_state(Setup.waiting_target)
+    await message.answer(
+        f"✅ Источник: <b>{config.source_label}</b>\n"
+        f"Режим: {'📡 мгновенный (бот читает канал напрямую)' if mode == 'live' else '🌐 опрос веб-версии'}\n"
+        f"{note}\n"
+        "<b>Шаг 2 из 2.</b> Пришли ссылку или @username <b>своего</b> канала.\n"
+        "Бот уже должен быть там админом с правом «Публикация сообщений»."
+    )
+
+
+async def _is_bot_admin_in(bot: Bot, chat_id: Any) -> bool:
+    """Проверяет, что бот админ в чате (нужно, чтобы получать channel_post)."""
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False
+    return member.status == ChatMemberStatus.ADMINISTRATOR
+
+
 @router.message(Setup.waiting_source)
 async def step_source(message: Message, state: FSMContext) -> None:
-    """Разбираем ссылку на пост и проверяем доступность канала."""
+    """
+    Принимает источник тремя способами:
+      1) пересланный пост (работает с приватными каналами);
+      2) ссылка t.me/имя/123 — публичный канал, читается через веб-версию;
+      3) ссылка t.me/c/123.../456 — приватный канал, бот должен быть его админом.
+    """
     if not is_owner(message):
         return
-    parsed = parse_post_link(message.text or "")
+    bot: Bot = message.bot
+    text = message.text or message.caption or ""
+
+    # --- 1. Пересланный пост из канала ----------------------------------- #
+    origin = message.forward_origin
+    if isinstance(origin, MessageOriginChannel):
+        chat = origin.chat
+        if not await _is_bot_admin_in(bot, chat.id):
+            await message.answer(
+                f"⚠️ Нашёл канал <b>{html_lib.escape(chat.title or '')}</b>, "
+                "но меня там нет.\n\n"
+                "Telegram <b>запрещает ботам вступать в каналы по ссылке</b> — "
+                "добавить меня может только админ канала.\n\n"
+                + (
+                    f"Канал публичный (@{chat.username}) — просто пришли ссылку "
+                    f"<code>https://t.me/{chat.username}/123</code>, "
+                    "и я буду читать его через веб-версию, без вступления.\n"
+                    if chat.username else
+                    "Канал приватный, поэтому вариант один: попроси админа канала "
+                    "добавить меня туда администратором, затем перешли пост снова.\n"
+                )
+            )
+            return
+
+        await _finish_source_step(
+            message, state,
+            username=chat.username,
+            chat_id=chat.id,
+            title=chat.title,
+            post_id=origin.message_id,
+            mode="live",
+            note="Новые посты будут копироваться мгновенно, без задержки.\n\n",
+        )
+        return
+
+    # --- 2. Приватная ссылка t.me/c/<id>/<post> --------------------------- #
+    private = parse_private_post_link(text)
+    if private:
+        chat_id, post_id = private
+        try:
+            chat = await bot.get_chat(chat_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            await message.answer(
+                "❌ Это приватный канал, и меня в нём нет.\n\n"
+                "Боты <b>не могут вступать по ссылке-приглашению</b> — "
+                "это ограничение Telegram.\n\n"
+                "<b>Что делать:</b>\n"
+                "1. Открой канал-источник → Управление → Администраторы;\n"
+                "2. Добавь меня администратором (хватит права «Публикация сообщений»);\n"
+                "3. Перешли мне сюда любой пост из этого канала.\n\n"
+                "Если ты не админ источника — приватный канал читать не получится, "
+                "нужен публичный."
+            )
+            return
+        if not await _is_bot_admin_in(bot, chat_id):
+            await message.answer(
+                "❌ Я вижу канал, но я там не администратор. "
+                "Без прав админа Telegram не присылает мне новые посты.\n"
+                "Выдай мне права администратора и перешли пост снова."
+            )
+            return
+        await _finish_source_step(
+            message, state,
+            username=chat.username, chat_id=chat_id, title=chat.title,
+            post_id=post_id, mode="live",
+            note="Новые посты будут копироваться мгновенно, без задержки.\n\n",
+        )
+        return
+
+    # --- 3. Ссылка-приглашение t.me/+hash -------------------------------- #
+    if INVITE_RE.search(text):
+        await message.answer(
+            "❌ По ссылке-приглашению бот вступить не может — "
+            "в Telegram Bot API просто нет такого метода.\n\n"
+            "<b>Что делать:</b>\n"
+            "1. Зайди в канал-источник сам;\n"
+            "2. Управление каналом → Администраторы → Добавить → выбери меня;\n"
+            "3. Перешли мне любой пост из канала.\n\n"
+            "Тогда я буду получать посты напрямую и мгновенно."
+        )
+        return
+
+    # --- 4. Обычная публичная ссылка ------------------------------------- #
+    parsed = parse_post_link(text)
     if not parsed:
         await message.answer(
-            "❌ Не похоже на ссылку на пост.\n"
-            "Нужен формат <code>https://t.me/имя_канала/123</code>"
+            "❌ Не похоже на ссылку на пост.\n\n"
+            "Подойдёт любое из:\n"
+            "• <b>пересланный пост</b> из канала (лучший вариант);\n"
+            "• <code>https://t.me/имя_канала/123</code>;\n"
+            "• <code>https://t.me/c/1916432895/17544</code> — если я админ того канала."
         )
         return
 
     channel, post_id = parsed
     await message.answer(f"🔎 Проверяю канал @{channel}…")
 
+    # если бот уже админ в источнике — берём мгновенный режим
+    if await _is_bot_admin_in(bot, f"@{channel}"):
+        chat = await bot.get_chat(f"@{channel}")
+        await _finish_source_step(
+            message, state,
+            username=channel, chat_id=chat.id, title=chat.title,
+            post_id=post_id, mode="live",
+            note="Я админ этого канала — копирую мгновенно, без опроса.\n\n",
+        )
+        return
+
     async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
         try:
             posts = await fetch_channel_posts(session, channel)
         except RuntimeError as err:
             await message.answer(
-                f"❌ {err}\n\nПопробуй другой канал — нужен публичный, "
-                "без обязательной подписки."
+                f"❌ {err}\n\nЕсли канал приватный — добавь меня в него "
+                "администратором и перешли любой пост сюда."
             )
             return
 
     latest = posts[-1].post_id if posts else post_id
-    config.source_channel = channel
-    config.last_post_id = post_id
-    save_config(config)
-    set_last_seen(channel, post_id)
-
-    await state.set_state(Setup.waiting_target)
-    await message.answer(
-        f"✅ Источник: <b>@{channel}</b>\n"
-        f"Последний пост в канале сейчас: <code>{latest}</code>, "
-        f"копировать начну с <code>{post_id + 1}</code>.\n\n"
-        "<b>Шаг 2 из 2.</b> Пришли ссылку или @username <b>своего</b> канала.\n"
-        "Бот уже должен быть там админом с правом «Публикация сообщений»."
+    await _finish_source_step(
+        message, state,
+        username=channel, chat_id=None, title=None,
+        post_id=post_id, mode="web",
+        note=(f"Последний пост сейчас: <code>{latest}</code>, "
+              f"копировать начну с <code>{post_id + 1}</code>.\n\n"),
     )
 
 
@@ -803,15 +981,89 @@ async def step_target(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     assert reposter is not None
-    reposter.start()
+    if config.mode == "web":
+        reposter.start()      # в режиме live опрашивать нечего
 
+    how = ("Новые посты прилетают ко мне сразу — копирую без задержки."
+           if config.mode == "live"
+           else f"Проверяю источник каждые <b>{config.interval}</b> сек.")
     await message.answer(
         "🚀 <b>Готово, репостинг запущен!</b>\n\n"
-        f"Источник: <b>@{config.source_channel}</b>\n"
+        f"Источник: <b>{config.source_label}</b>\n"
         f"Цель: <b>{target}</b>\n"
-        f"Проверка каждые <b>{config.interval}</b> сек.\n\n"
+        f"{how}\n\n"
         "Команды: /status, /stop, /set_interval &lt;секунды&gt;"
     )
+
+
+# --------------------------------------------------------------------------- #
+#             МГНОВЕННЫЙ РЕЖИМ: бот — админ канала-источника                  #
+# --------------------------------------------------------------------------- #
+
+# буфер альбомов: media_group_id -> список message_id
+_album_buffer: Dict[str, List[int]] = {}
+
+
+async def _copy_ids(bot: Bot, message_ids: List[int]) -> None:
+    """Копирует один пост или целый альбом в целевой канал."""
+    if not message_ids or not config.target_channel or config.source_chat_id is None:
+        return
+    src, dst = config.source_chat_id, config.target_channel
+    try:
+        if len(message_ids) == 1:
+            await with_retry(lambda: bot.copy_message(
+                chat_id=dst, from_chat_id=src, message_id=message_ids[0]))
+        else:
+            # copy_messages сохраняет альбом единым сообщением
+            await with_retry(lambda: bot.copy_messages(
+                chat_id=dst, from_chat_id=src, message_ids=sorted(message_ids)))
+    except TelegramForbiddenError as err:
+        log.error("Нет доступа к целевому каналу: %s", err.message)
+        config.enabled = False
+        save_config(config)
+        if config.owner_id:
+            await bot.send_message(
+                config.owner_id,
+                "⛔️ Репостинг остановлен: бот потерял доступ к целевому каналу.")
+        return
+    except TelegramBadRequest as err:
+        # пост удалён, защищённый контент и т.п. — пропускаем, не роняя бота
+        log.error("Не удалось скопировать %s: %s", message_ids, err.message)
+        return
+    except Exception as err:
+        log.error("Ошибка копирования %s: %s", message_ids, err)
+        return
+
+    config.last_post_id = max(message_ids)
+    save_config(config)
+    log.info("Скопировано мгновенно: %s → %s", message_ids, dst)
+
+
+async def _flush_album(bot: Bot, group_id: str) -> None:
+    """Ждёт остальные части альбома и отправляет их одним сообщением."""
+    await asyncio.sleep(ALBUM_WAIT)
+    ids = _album_buffer.pop(group_id, [])
+    await _copy_ids(bot, ids)
+
+
+@router.channel_post()
+async def on_channel_post(post: Message) -> None:
+    """Новый пост в канале-источнике — копируем сразу (режим live)."""
+    if config.mode != "live" or not config.enabled:
+        return
+    if config.source_chat_id is None or post.chat.id != config.source_chat_id:
+        return
+    if not config.target_channel:
+        return
+
+    if post.media_group_id:
+        buf = _album_buffer.setdefault(post.media_group_id, [])
+        buf.append(post.message_id)
+        if len(buf) == 1:      # первая часть альбома — заводим таймер на сборку
+            asyncio.create_task(_flush_album(post.bot, post.media_group_id))
+        return
+
+    await _copy_ids(post.bot, [post.message_id])
 
 
 @router.message(Command("stop"))
@@ -832,16 +1084,18 @@ async def cmd_status(message: Message) -> None:
     """Показывает текущие настройки и последний скопированный пост."""
     if not is_owner(message):
         return
-    running = "🟢 работает" if (reposter and reposter.running and config.enabled) \
-        else "🔴 остановлен"
-    src = f"@{config.source_channel}" if config.source_channel else "— не задан"
+    live = config.mode == "live"
+    active = config.enabled and (live or (reposter and reposter.running))
     dst = config.target_channel or "— не задан"
+    mode_line = ("📡 мгновенный — я админ источника, посты приходят сразу"
+                 if live else
+                 f"🌐 опрос веб-версии раз в {config.interval} сек")
     await message.answer(
-        f"<b>Статус:</b> {running}\n"
-        f"<b>Источник:</b> {src}\n"
+        f"<b>Статус:</b> {'🟢 работает' if active else '🔴 остановлен'}\n"
+        f"<b>Источник:</b> {config.source_label}\n"
         f"<b>Целевой канал:</b> {dst}\n"
-        f"<b>Последний скопированный ID:</b> <code>{config.last_post_id}</code>\n"
-        f"<b>Интервал проверки:</b> {config.interval} сек"
+        f"<b>Режим:</b> {mode_line}\n"
+        f"<b>Последний скопированный ID:</b> <code>{config.last_post_id}</code>"
     )
 
 
@@ -896,10 +1150,12 @@ async def main() -> None:
     reposter = Reposter(bot, config)
 
     # если настройки уже есть и репостинг был включён — продолжаем после перезапуска
-    if config.enabled and config.source_channel and config.target_channel:
-        reposter.start()
-        log.info("Репостинг восстановлен: @%s → %s",
-                 config.source_channel, config.target_channel)
+    if config.enabled and config.target_channel:
+        if config.mode == "web" and config.source_channel:
+            reposter.start()
+        log.info("Репостинг восстановлен (%s): %s → %s",
+                 config.mode, config.source_channel or config.source_chat_id,
+                 config.target_channel)
 
     me = await bot.get_me()
     log.info("Бот запущен: @%s (id=%s)", me.username, me.id)
