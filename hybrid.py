@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,7 +59,15 @@ from userbot import (
 )
 # управление источниками прямо в чате с ботом: переслал пост — добавил канал,
 # /remove — убрал
-from control_bot import build_router, load_sources, run_control_bot, save_sources
+from control_bot import (
+    build_router,
+    load_config,
+    load_sources,
+    run_control_bot,
+    save_config,
+    save_sources,
+)
+from login_via_bot import read_saved_session
 
 # --------------------------------------------------------------------------- #
 #                                  КОНФИГ                                     #
@@ -449,110 +458,201 @@ async def check_targets(api: BotAPI, targets: List[str]) -> List[str]:
     return good
 
 
-async def get_session() -> str:
+# --------------------------------------------------------------------------- #
+#                      РЕПОСТЕР, УПРАВЛЯЕМЫЙ ИЗ ЧАТА                          #
+# --------------------------------------------------------------------------- #
+
+
+class App:
     """
-    Достаёт SESSION_STRING: из переменной окружения, из ранее сохранённого файла
-    или — если ничего нет — проводит вход прямо в чате с ботом.
+    Состояние репостера. Поднимается не при старте процесса, а тогда, когда
+    в чате с ботом введено всё нужное: ключи приложения, вход в аккаунт и
+    целевой канал. Поэтому из окружения обязателен только BOT_TOKEN.
     """
-    if SESSION_STRING:
-        return SESSION_STRING
-    # импорт отложенный: когда сессия уже есть, aiogram не нужен вовсе
-    from login_via_bot import read_saved_session, session_via_bot
 
-    saved = read_saved_session()
-    if saved:
-        log.info("Сессия взята из session.txt")
-        return saved
-    # на хостинге без терминала код из Telegram вводится прямо в чате с ботом
-    return await session_via_bot(BOT_TOKEN, API_ID, API_HASH, OWNER_ID)
+    def __init__(self, http: aiohttp.ClientSession) -> None:
+        self.api = BotAPI(BOT_TOKEN, http)
+        self.cfg: Dict[str, Any] = load_config()
+        self.routes: Dict[int, str] = {}
+        self.client: Optional[TelegramClient] = None
+        self.running = False
+        self._task: Optional[asyncio.Task] = None
+        self._seed_from_env()
 
+    # --- настройки ------------------------------------------------------ #
 
-async def run() -> None:
-    # SESSION_STRING намеренно не в списке: если её нет, войдём через чат с ботом
-    for name, value in (("BOT_TOKEN", BOT_TOKEN), ("API_ID", API_ID),
-                        ("API_HASH", API_HASH), ("TARGET", TARGET)):
-        if not value:
-            log.error("Не задана переменная окружения %s", name)
-            sys.exit(1)
+    def _seed_from_env(self) -> None:
+        """Переменные окружения — лишь значения по умолчанию для первого запуска."""
+        changed = False
+        for key, value in (("api_id", API_ID), ("api_hash", API_HASH),
+                           ("target", TARGET), ("owner_id", OWNER_ID)):
+            if value and not self.cfg.get(key):
+                self.cfg[key] = value
+                changed = True
+        if changed:
+            self.save()
 
-    session_string = await get_session()
+    def save(self) -> None:
+        save_config(self.cfg)
 
-    async with aiohttp.ClientSession() as http:
-        api = BotAPI(BOT_TOKEN, http)
-        if not await check_targets(api, [TARGET]):
-            log.error("В %s публиковать нельзя — останавливаюсь", TARGET)
-            sys.exit(1)
+    def has_session(self) -> bool:
+        return bool(SESSION_STRING or read_saved_session())
 
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.start()
-        me = await client.get_me()
+    # --- вспомогательное для бота настройки ----------------------------- #
+
+    async def check_target(self, target: str) -> Tuple[bool, str]:
+        """Проверяет, что бот админ канала и может публиковать."""
+        me = await self.api.call("getMe", {})
+        if not me:
+            return False, "Неверный токен бота."
+        member = await self.api.call("getChatMember",
+                                     {"chat_id": target, "user_id": str(me["id"])})
+        if not member:
+            return False, (f"Не вижу канал {target}. Добавьте меня туда "
+                           "администратором и повторите.")
+        if member.get("status") != "administrator":
+            return False, f"Я в {target} не администратор (статус: {member.get('status')})."
+        if not member.get("can_post_messages"):
+            return False, "У меня нет права «Публикация сообщений» в этом канале."
+        return True, "ok"
+
+    async def resolve(self, ref: str):
+        """Находит канал аккаунтом, при необходимости вступая в него."""
+        if self.client is None:
+            raise RuntimeError("аккаунт не подключён, сначала /login")
+        return await resolve_source(self.client, ref)
+
+    async def on_session(self, session_string: str) -> None:
+        """Вызывается мастером входа после успешной авторизации."""
+        await self.restart()
+
+    # --- запуск и остановка --------------------------------------------- #
+
+    def ready(self) -> Optional[str]:
+        """Чего не хватает для запуска; None — можно стартовать."""
+        if not (self.cfg.get("api_id") and self.cfg.get("api_hash")):
+            return "нет api_id/api_hash (/setup)"
+        if not self.has_session():
+            return "нет входа в аккаунт (/login)"
+        if not self.cfg.get("target"):
+            return "не задан целевой канал (/target)"
+        return None
+
+    async def stop(self) -> None:
+        self.running = False
+        if self._task:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        if self.client is not None:
+            with suppress(Exception):
+                await self.client.disconnect()
+            self.client = None
+
+    async def restart(self, message: Any = None) -> None:
+        """Поднимает репостинг заново — после входа, смены цели и т.п."""
+        blocker = self.ready()
+        if blocker:
+            log.info("Репостинг пока не запущен: %s", blocker)
+            return
+        await self.stop()
+        try:
+            await self._start()
+        except Exception as err:
+            log.exception("Не удалось запустить репостинг: %s", err)
+            if message is not None:
+                with suppress(Exception):
+                    await message.answer(f"❌ Не удалось запустить репостинг: {err}")
+
+    async def _start(self) -> None:
+        """Подключает аккаунт, восстанавливает источники, вешает обработчики."""
+        session_string = SESSION_STRING or read_saved_session()
+        self.client = TelegramClient(
+            StringSession(session_string), self.cfg["api_id"], self.cfg["api_hash"])
+        await self.client.start()
+        me = await self.client.get_me()
         log.info("Читает аккаунт: %s (@%s)", me.first_name, me.username or me.id)
 
-        # routes общий с ботом управления: он правит его на лету, поэтому
-        # добавление и удаление источника работают без перезапуска
-        routes: Dict[int, str] = {}
+        await self._restore_sources()
 
-        # список источников: sources.json, а при первом запуске — из SOURCES
+        # фильтруем по routes вручную: список источников меняется во время
+        # работы, перерегистрировать обработчики не нужно
+        @self.client.on(events.Album())
+        async def on_album(event: events.Album.Event) -> None:
+            target = self.routes.get(event.chat_id)
+            if target:
+                await publish(self.client, self.api, list(event.messages), target)
+
+        @self.client.on(events.NewMessage())
+        async def on_message(event: events.NewMessage.Event) -> None:
+            if event.message.grouped_id:      # части альбома заберёт on_album
+                return
+            target = self.routes.get(event.chat_id)
+            if target:
+                await publish(self.client, self.api, [event.message], target)
+
+        self.running = True
+        self._task = asyncio.create_task(self.client.run_until_disconnected())
+        log.info("Репостинг запущен, источников: %s", len(self.routes))
+
+    async def _restore_sources(self) -> None:
+        """Поднимает сохранённые источники и догоняет пропущенное."""
+        self.routes.clear()
         stored = load_sources()
         if not stored and SOURCES:
             log.info("sources.json пуст — беру источники из переменной SOURCES")
-            stored = [{"chat_id": None, "ref": ref, "title": ref, "target": target}
-                      for ref, target in parse_sources(SOURCES, TARGET)]
+            stored = [{"ref": ref, "title": ref, "target": target}
+                      for ref, target in parse_sources(SOURCES, self.cfg["target"])]
 
         resolved: List[Dict[str, Any]] = []
         for item in stored:
             ref = item.get("ref") or item.get("chat_id")
             try:
-                source = await resolve_source(client, str(ref))
+                source = await resolve_source(self.client, str(ref))
             except Exception as err:
                 # недоступный источник не должен мешать остальным
                 log.error("Источник %s пропущен: %s", item.get("title", ref), err)
-                resolved.append(item)          # в списке останется, помечен в /list
+                resolved.append(item)        # останется в /list с пометкой
                 continue
             chat_id = utils.get_peer_id(source)
-            target = item.get("target") or TARGET
-            routes[chat_id] = target
+            target = item.get("target") or self.cfg["target"]
+            self.routes[chat_id] = target
             resolved.append({"chat_id": chat_id,
                              "title": getattr(source, "title", None) or str(ref),
                              "target": target})
             log.info("Маршрут: «%s» → %s", resolved[-1]["title"], target)
-        save_sources(resolved)                 # нормализуем файл: ссылки → chat_id
-
-        if routes:
-            log.info("Источников подключено: %s (публикует бот)", len(routes))
-        else:
-            log.warning("Источников пока нет — перешлите боту пост из канала")
-
-        # фильтруем по routes вручную: так список источников можно менять
-        # во время работы, не перерегистрируя обработчики
-        @client.on(events.Album())
-        async def on_album(event: events.Album.Event) -> None:
-            target = routes.get(event.chat_id)
-            if target:
-                await publish(client, api, list(event.messages), target)
-
-        @client.on(events.NewMessage())
-        async def on_message(event: events.NewMessage.Event) -> None:
-            if event.message.grouped_id:        # части альбома заберёт on_album
-                return
-            target = routes.get(event.chat_id)
-            if target:
-                await publish(client, api, [event.message], target)
+        save_sources(resolved)               # нормализуем файл: ссылки → chat_id
 
         for item in resolved:
-            if item.get("chat_id") in routes:
-                source = await client.get_entity(item["chat_id"])
-                await catch_up(client, api, source, routes[item["chat_id"]])
+            if item.get("chat_id") in self.routes:
+                source = await self.client.get_entity(item["chat_id"])
+                await catch_up(self.client, self.api, source,
+                               self.routes[item["chat_id"]])
 
-        # бот управления живёт рядом: через него добавляют и убирают источники
-        control = build_router(client, routes, TARGET, OWNER_ID,
-                               resolve_source, lambda t: check_targets(api, [t]))
 
-        log.info("Слушаю новые посты. Остановить — Ctrl+C")
-        await asyncio.gather(
-            client.run_until_disconnected(),
-            run_control_bot(BOT_TOKEN, control),
-        )
+async def run() -> None:
+    """Из окружения обязателен только BOT_TOKEN — остальное вводится в чате."""
+    if not BOT_TOKEN:
+        log.error("Не задана переменная окружения BOT_TOKEN "
+                  "(токен бота от @BotFather)")
+        sys.exit(1)
+
+    async with aiohttp.ClientSession() as http:
+        app = App(http)
+        blocker = app.ready()
+        if blocker:
+            log.warning("=" * 68)
+            log.warning("Репостинг ещё не настроен: %s", blocker)
+            log.warning("Откройте бота в Telegram и отправьте /start")
+            log.warning("=" * 68)
+        else:
+            await app.restart()
+
+        # бот настройки живёт всегда: через него вводят ключи, входят в
+        # аккаунт, задают целевой канал и добавляют источники
+        await run_control_bot(BOT_TOKEN, build_router(app))
+        await app.stop()
 
 
 if __name__ == "__main__":
