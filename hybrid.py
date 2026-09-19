@@ -56,6 +56,9 @@ from userbot import (
     resolve_source,
     save_last_id,
 )
+# управление источниками прямо в чате с ботом: переслал пост — добавил канал,
+# /remove — убрал
+from control_bot import build_router, load_sources, run_control_bot, save_sources
 
 # --------------------------------------------------------------------------- #
 #                                  КОНФИГ                                     #
@@ -66,10 +69,9 @@ API_ID = int(os.getenv("API_ID", "0"))                  # читает
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-# Источники — сколько угодно, через запятую или с новой строки. Каждый может быть
-# @channel, t.me/+хеш, t.me/c/<id>/<post> или -100...
-# По умолчанию всё летит в TARGET; своя цель для источника пишется через "=>":
-#     SOURCES="@news, @sport => @my_sport, https://t.me/+хеш"
+# Источники обычно задаются в чате с ботом (пересланный пост) и хранятся в
+# sources.json. SOURCES нужна только для первого запуска, чтобы не настраивать
+# руками: несколько каналов через запятую, своя цель через "=>".
 SOURCES = os.getenv("SOURCES", "") or os.getenv("SOURCE", "")
 TARGET = os.getenv("TARGET", "").strip()   # цель по умолчанию
 
@@ -468,20 +470,17 @@ async def get_session() -> str:
 async def run() -> None:
     # SESSION_STRING намеренно не в списке: если её нет, войдём через чат с ботом
     for name, value in (("BOT_TOKEN", BOT_TOKEN), ("API_ID", API_ID),
-                        ("API_HASH", API_HASH),
-                        ("SOURCES", SOURCES), ("TARGET", TARGET)):
+                        ("API_HASH", API_HASH), ("TARGET", TARGET)):
         if not value:
             log.error("Не задана переменная окружения %s", name)
             sys.exit(1)
 
-    pairs = parse_sources(SOURCES, TARGET)
     session_string = await get_session()
 
     async with aiohttp.ClientSession() as http:
         api = BotAPI(BOT_TOKEN, http)
-        allowed = await check_targets(api, sorted({t for _, t in pairs}))
-        if not allowed:
-            log.error("Ни одного пригодного целевого канала — останавливаюсь")
+        if not await check_targets(api, [TARGET]):
+            log.error("В %s публиковать нельзя — останавливаюсь", TARGET)
             sys.exit(1)
 
         client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
@@ -489,36 +488,50 @@ async def run() -> None:
         me = await client.get_me()
         log.info("Читает аккаунт: %s (@%s)", me.first_name, me.username or me.id)
 
-        routes: Dict[int, str] = {}          # chat_id источника -> целевой канал
-        sources: List[Any] = []
-        for ref, target in pairs:
-            if target not in allowed:
-                log.error("Источник %s пропущен: в %s публиковать нельзя", ref, target)
-                continue
+        # routes общий с ботом управления: он правит его на лету, поэтому
+        # добавление и удаление источника работают без перезапуска
+        routes: Dict[int, str] = {}
+
+        # список источников: sources.json, а при первом запуске — из SOURCES
+        stored = load_sources()
+        if not stored and SOURCES:
+            log.info("sources.json пуст — беру источники из переменной SOURCES")
+            stored = [{"chat_id": None, "ref": ref, "title": ref, "target": target}
+                      for ref, target in parse_sources(SOURCES, TARGET)]
+
+        resolved: List[Dict[str, Any]] = []
+        for item in stored:
+            ref = item.get("ref") or item.get("chat_id")
             try:
-                source = await resolve_source(client, ref)
+                source = await resolve_source(client, str(ref))
             except Exception as err:
-                # один недоступный источник не должен ронять остальные
-                log.error("Источник %s пропущен: %s", ref, err)
+                # недоступный источник не должен мешать остальным
+                log.error("Источник %s пропущен: %s", item.get("title", ref), err)
+                resolved.append(item)          # в списке останется, помечен в /list
                 continue
-            routes[utils.get_peer_id(source)] = target
-            sources.append(source)
-            log.info("Маршрут: «%s» → %s",
-                     getattr(source, "title", ref), target)
+            chat_id = utils.get_peer_id(source)
+            target = item.get("target") or TARGET
+            routes[chat_id] = target
+            resolved.append({"chat_id": chat_id,
+                             "title": getattr(source, "title", None) or str(ref),
+                             "target": target})
+            log.info("Маршрут: «%s» → %s", resolved[-1]["title"], target)
+        save_sources(resolved)                 # нормализуем файл: ссылки → chat_id
 
-        if not sources:
-            log.error("Ни один источник не доступен — останавливаюсь")
-            await client.disconnect()
-            sys.exit(1)
-        log.info("Источников подключено: %s (публикует бот)", len(sources))
+        if routes:
+            log.info("Источников подключено: %s (публикует бот)", len(routes))
+        else:
+            log.warning("Источников пока нет — перешлите боту пост из канала")
 
-        @client.on(events.Album(chats=sources))
+        # фильтруем по routes вручную: так список источников можно менять
+        # во время работы, не перерегистрируя обработчики
+        @client.on(events.Album())
         async def on_album(event: events.Album.Event) -> None:
             target = routes.get(event.chat_id)
             if target:
                 await publish(client, api, list(event.messages), target)
 
-        @client.on(events.NewMessage(chats=sources))
+        @client.on(events.NewMessage())
         async def on_message(event: events.NewMessage.Event) -> None:
             if event.message.grouped_id:        # части альбома заберёт on_album
                 return
@@ -526,11 +539,20 @@ async def run() -> None:
             if target:
                 await publish(client, api, [event.message], target)
 
-        for source in sources:
-            await catch_up(client, api, source, routes[utils.get_peer_id(source)])
+        for item in resolved:
+            if item.get("chat_id") in routes:
+                source = await client.get_entity(item["chat_id"])
+                await catch_up(client, api, source, routes[item["chat_id"]])
+
+        # бот управления живёт рядом: через него добавляют и убирают источники
+        control = build_router(client, routes, TARGET, OWNER_ID,
+                               resolve_source, lambda t: check_targets(api, [t]))
 
         log.info("Слушаю новые посты. Остановить — Ctrl+C")
-        await client.run_until_disconnected()
+        await asyncio.gather(
+            client.run_until_disconnected(),
+            run_control_bot(BOT_TOKEN, control),
+        )
 
 
 if __name__ == "__main__":
