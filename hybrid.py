@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Message,
@@ -49,7 +49,13 @@ from telethon.tl.types import (
 
 # resolve_source умеет вступать по t.me/+хеш — переиспользуем, чтобы логика
 # вступления жила в одном месте
-from userbot import resolve_source
+from userbot import (
+    _entity_with_cache,
+    get_last_id,
+    parse_sources,
+    resolve_source,
+    save_last_id,
+)
 
 # --------------------------------------------------------------------------- #
 #                                  КОНФИГ                                     #
@@ -60,8 +66,12 @@ API_ID = int(os.getenv("API_ID", "0"))                  # читает
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-SOURCE = os.getenv("SOURCE", "").strip()   # @channel, t.me/+хеш, t.me/c/<id>/<post>, -100...
-TARGET = os.getenv("TARGET", "").strip()   # @username вашего канала или -100...
+# Источники — сколько угодно, через запятую или с новой строки. Каждый может быть
+# @channel, t.me/+хеш, t.me/c/<id>/<post> или -100...
+# По умолчанию всё летит в TARGET; своя цель для источника пишется через "=>":
+#     SOURCES="@news, @sport => @my_sport, https://t.me/+хеш"
+SOURCES = os.getenv("SOURCES", "") or os.getenv("SOURCE", "")
+TARGET = os.getenv("TARGET", "").strip()   # цель по умолчанию
 
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 ALBUM_WAIT = 2.0
@@ -82,19 +92,9 @@ log = logging.getLogger("hybrid")
 logging.getLogger("telethon").setLevel(logging.WARNING)
 
 
-def load_last_id() -> int:
-    if STATE_FILE.exists():
-        try:
-            return int(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("last_id", 0))
-        except (ValueError, OSError):
-            log.error("Не читается %s", STATE_FILE.name)
-    return 0
-
-
-def save_last_id(value: int) -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"last_id": value}), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+# Публикуем по одному посту за раз, даже когда источников много: иначе
+# несколько каналов разом упрутся в лимит Telegram на отправку.
+send_lock = asyncio.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -306,12 +306,19 @@ async def fetch_media(client: TelegramClient, msg: Message) -> Optional[bytes]:
 # --------------------------------------------------------------------------- #
 
 
-async def publish(client: TelegramClient, api: BotAPI, messages: List[Message]) -> None:
-    """Скачивает пост аккаунтом и публикует его ботом."""
+async def publish(client: TelegramClient, api: BotAPI, messages: List[Message],
+                  target: str) -> None:
+    """Скачивает пост аккаунтом и публикует его ботом в указанный канал."""
     messages = sorted((m for m in messages if m is not None), key=lambda m: m.id)
     if not messages:
         return
+    async with send_lock:                    # очередь на публикацию общая
+        await _publish_locked(client, api, messages, target)
 
+
+async def _publish_locked(client: TelegramClient, api: BotAPI,
+                          messages: List[Message], target: str) -> None:
+    """Сама публикация — вызывается уже под send_lock."""
     await asyncio.sleep(SEND_DELAY)
     first = messages[0]
     text = entities_to_html(first.message or "", first.entities)
@@ -338,16 +345,16 @@ async def publish(client: TelegramClient, api: BotAPI, messages: List[Message]) 
 
         if len(media_json) > 1:
             ok = await api.call("sendMediaGroup",
-                                {"chat_id": TARGET, "media": media_json}, files)
+                                {"chat_id": target, "media": media_json}, files)
             if ok:
-                save_last_id(messages[-1].id)
+                save_last_id(STATE_FILE, messages[0].chat_id, messages[-1].id)
                 log.info("Опубликован альбом %s", [m.id for m in messages])
                 return
             log.error("Альбом %s не ушёл — отправляю по одному",
                       [m.id for m in messages])
         # альбом собрать не вышло — шлём части по отдельности
         for msg in messages:
-            await publish(client, api, [msg])
+            await _publish_locked(client, api, [msg], target)
         return
 
     # --- одиночный пост -------------------------------------------------- #
@@ -355,7 +362,7 @@ async def publish(client: TelegramClient, api: BotAPI, messages: List[Message]) 
     if kind:
         blob = await fetch_media(client, first)
         if blob is not None:
-            data: Dict[str, Any] = {"chat_id": TARGET}
+            data: Dict[str, Any] = {"chat_id": target}
             # у кружков и стикеров подписи нет — текст уйдёт отдельным сообщением
             if text and kind not in ("sticker", "video_note"):
                 data["caption"] = cut(text, TG_CAPTION_LIMIT)
@@ -367,33 +374,34 @@ async def publish(client: TelegramClient, api: BotAPI, messages: List[Message]) 
                 if text and (len(text) > TG_CAPTION_LIMIT
                              or kind in ("sticker", "video_note")):
                     await api.call("sendMessage", {
-                        "chat_id": TARGET, "text": cut(text, TG_TEXT_LIMIT),
+                        "chat_id": target, "text": cut(text, TG_TEXT_LIMIT),
                         "parse_mode": "HTML", "disable_web_page_preview": True})
-                save_last_id(first.id)
+                save_last_id(STATE_FILE, first.chat_id, first.id)
                 log.info("Опубликован пост %s (%s)", first.id, kind)
             return
         # медиа не досталось — хотя бы текст не теряем
 
     if text:
         ok = await api.call("sendMessage", {
-            "chat_id": TARGET, "text": cut(text, TG_TEXT_LIMIT), "parse_mode": "HTML"})
+            "chat_id": target, "text": cut(text, TG_TEXT_LIMIT), "parse_mode": "HTML"})
         if ok:
-            save_last_id(first.id)
+            save_last_id(STATE_FILE, first.chat_id, first.id)
             log.info("Опубликован пост %s (текст)", first.id)
     else:
         log.info("Пост %s пустой — пропускаю", first.id)
 
 
-async def catch_up(client: TelegramClient, api: BotAPI, source) -> None:
+async def catch_up(client: TelegramClient, api: BotAPI, source, target: str) -> None:
     """Досылает посты, вышедшие пока скрипт был выключен."""
-    last_id = load_last_id()
+    title = getattr(source, "title", utils.get_peer_id(source))
+    last_id = get_last_id(STATE_FILE, utils.get_peer_id(source))
     if not last_id:
-        log.info("Состояния нет — публикую только новые посты")
+        log.info("Состояния по «%s» нет — публикую только новые посты", title)
         return
     missed = [m async for m in client.iter_messages(source, min_id=last_id, limit=50)]
     if not missed:
         return
-    log.info("Догоняю %s пропущенных постов", len(missed))
+    log.info("Догоняю %s пропущенных постов из «%s»", len(missed), title)
 
     groups: Dict[int, List[Message]] = {}
     singles: List[Message] = []
@@ -403,9 +411,9 @@ async def catch_up(client: TelegramClient, api: BotAPI, source) -> None:
         else:
             singles.append(msg)
     for msg in singles:
-        await publish(client, api, [msg])
+        await publish(client, api, [msg], target)
     for album in groups.values():
-        await publish(client, api, album)
+        await publish(client, api, album, target)
 
 
 # --------------------------------------------------------------------------- #
@@ -413,39 +421,45 @@ async def catch_up(client: TelegramClient, api: BotAPI, source) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def check_target(api: BotAPI) -> bool:
-    """Проверяет, что бот админ целевого канала и может публиковать."""
+async def check_targets(api: BotAPI, targets: List[str]) -> List[str]:
+    """Оставляет только те каналы, где бот админ с правом публикации."""
     me = await api.call("getMe", {})
     if not me:
         log.error("Неверный BOT_TOKEN")
-        return False
+        return []
     log.info("Публикует бот: @%s", me.get("username"))
 
-    member = await api.call("getChatMember",
-                            {"chat_id": TARGET, "user_id": str(me["id"])})
-    if not member:
-        log.error("Бот не видит канал %s — добавь его туда администратором", TARGET)
-        return False
-    if member.get("status") != "administrator":
-        log.error("Бот в %s не администратор (статус: %s)", TARGET, member.get("status"))
-        return False
-    if not member.get("can_post_messages"):
-        log.error("У бота нет права «Публикация сообщений» в %s", TARGET)
-        return False
-    return True
+    good: List[str] = []
+    for target in targets:
+        member = await api.call("getChatMember",
+                                {"chat_id": target, "user_id": str(me["id"])})
+        if not member:
+            log.error("Бот не видит канал %s — добавь его туда администратором", target)
+        elif member.get("status") != "administrator":
+            log.error("Бот в %s не администратор (статус: %s)",
+                      target, member.get("status"))
+        elif not member.get("can_post_messages"):
+            log.error("У бота нет права «Публикация сообщений» в %s", target)
+        else:
+            good.append(target)
+    return good
 
 
 async def run() -> None:
     for name, value in (("BOT_TOKEN", BOT_TOKEN), ("API_ID", API_ID),
                         ("API_HASH", API_HASH), ("SESSION_STRING", SESSION_STRING),
-                        ("SOURCE", SOURCE), ("TARGET", TARGET)):
+                        ("SOURCES", SOURCES), ("TARGET", TARGET)):
         if not value:
             log.error("Не задана переменная окружения %s", name)
             sys.exit(1)
 
+    pairs = parse_sources(SOURCES, TARGET)
+
     async with aiohttp.ClientSession() as http:
         api = BotAPI(BOT_TOKEN, http)
-        if not await check_target(api):
+        allowed = await check_targets(api, sorted({t for _, t in pairs}))
+        if not allowed:
+            log.error("Ни одного пригодного целевого канала — останавливаюсь")
             sys.exit(1)
 
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -453,26 +467,46 @@ async def run() -> None:
         me = await client.get_me()
         log.info("Читает аккаунт: %s (@%s)", me.first_name, me.username or me.id)
 
-        try:
-            source = await resolve_source(client, SOURCE)
-        except Exception as err:
-            log.error("Источник недоступен: %s", err)
+        routes: Dict[int, str] = {}          # chat_id источника -> целевой канал
+        sources: List[Any] = []
+        for ref, target in pairs:
+            if target not in allowed:
+                log.error("Источник %s пропущен: в %s публиковать нельзя", ref, target)
+                continue
+            try:
+                source = await resolve_source(client, ref)
+            except Exception as err:
+                # один недоступный источник не должен ронять остальные
+                log.error("Источник %s пропущен: %s", ref, err)
+                continue
+            routes[utils.get_peer_id(source)] = target
+            sources.append(source)
+            log.info("Маршрут: «%s» → %s",
+                     getattr(source, "title", ref), target)
+
+        if not sources:
+            log.error("Ни один источник не доступен — останавливаюсь")
             await client.disconnect()
             sys.exit(1)
-        log.info("Репостинг: %s → %s (публикует бот)",
-                 getattr(source, "title", source), TARGET)
+        log.info("Источников подключено: %s (публикует бот)", len(sources))
 
-        @client.on(events.Album(chats=source))
+        @client.on(events.Album(chats=sources))
         async def on_album(event: events.Album.Event) -> None:
-            await publish(client, api, list(event.messages))
+            target = routes.get(event.chat_id)
+            if target:
+                await publish(client, api, list(event.messages), target)
 
-        @client.on(events.NewMessage(chats=source))
+        @client.on(events.NewMessage(chats=sources))
         async def on_message(event: events.NewMessage.Event) -> None:
             if event.message.grouped_id:        # части альбома заберёт on_album
                 return
-            await publish(client, api, [event.message])
+            target = routes.get(event.chat_id)
+            if target:
+                await publish(client, api, [event.message], target)
 
-        await catch_up(client, api, source)
+        for source in sources:
+            await catch_up(client, api, source, routes[utils.get_peer_id(source)])
+
         log.info("Слушаю новые посты. Остановить — Ctrl+C")
         await client.run_until_disconnected()
 

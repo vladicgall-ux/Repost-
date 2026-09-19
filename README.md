@@ -1,6 +1,6 @@
 # Telegram Repost Bot
 
-Копирует новые посты из чужого канала в ваш. Два независимых варианта:
+Копирует новые посты из чужих каналов в ваш. Три независимых варианта:
 
 * **`main.py`** — бот на aiogram 3.x. Ничего, кроме токена от @BotFather, не нужно.
   Публичный источник читается через веб-версию `t.me/s/<канал>`, приватный — если
@@ -201,7 +201,7 @@ python userbot.py --login
 export API_ID=1234567
 export API_HASH=abcdef0123456789abcdef0123456789
 export SESSION_STRING="1BQANOTEuMTA4LjU2..."
-export SOURCE="https://t.me/+YZshvpW4VGgzZWQy"   # или @channel, или -100...
+export SOURCES="https://t.me/+YZshvpW4VGgzZWQy"  # можно несколько через запятую
 export TARGET="@my_channel"
 export SEND_DELAY=2
 python userbot.py
@@ -219,6 +219,7 @@ python userbot.py
 | `events.NewMessage` | одиночные посты; части альбомов пропускаются, чтобы не было дублей |
 | `copy_messages` | копия **без** пометки «Переслано из». Нужна пометка — замените тело на `client.forward_messages(target, messages)` |
 | `catch_up` | после рестарта досылает до 50 постов, вышедших пока скрипт не работал |
+| несколько источников | `SOURCES` через запятую, своя цель через `=>`, состояние по каждому каналу отдельно |
 | `userbot_state.json` | последний скопированный ID |
 | обработка `FloodWaitError` | ждёт ровно столько, сколько просит Telegram, и повторяет |
 
@@ -244,11 +245,40 @@ export BOT_TOKEN="1234567890:AAH..."          # публикует
 export API_ID=1234567                          # читает
 export API_HASH=abcdef0123456789abcdef0123456789
 export SESSION_STRING="1BQANOTEuMTA4LjU2..."   # из `python userbot.py --login`
-export SOURCE="https://t.me/+YZshvpW4VGgzZWQy"
+export SOURCES="https://t.me/+YZshvpW4VGgzZWQy"
 export TARGET="@my_channel"
 export SEND_DELAY=2
 python hybrid.py
 ```
+
+### Несколько источников
+
+`SOURCES` принимает сколько угодно каналов — через запятую или с новой строки.
+По умолчанию всё летит в `TARGET`, но любому источнику можно задать свою цель
+через `=>`:
+
+```bash
+# всё в один канал
+export SOURCES="@news, https://t.me/+YZshvpW4VGgzZWQy, -1001916432895"
+
+# разные источники в разные каналы
+export SOURCES="@news, @sport => @my_sport, @tech => @my_tech"
+export TARGET="@my_main"        # сюда пойдёт @news
+```
+
+Как это работает:
+
+* последний скопированный ID хранится **отдельно по каждому источнику**, так что
+  догон после рестарта не путает каналы;
+* публикация идёт строго по одному посту за раз — иначе несколько каналов разом
+  упрутся в лимит Telegram на отправку;
+* недоступный источник (закрыт, не пустили, опечатка в ссылке) **пропускается с
+  ошибкой в лог**, остальные продолжают работать;
+* целевые каналы проверяются на права бота при старте — тот, где бот не админ,
+  отключается вместе со своими источниками.
+
+`SOURCE` в единственном числе тоже понимается — старые конфиги не сломаются.
+То же самое работает и в `userbot.py`.
 
 `hybrid.py` переиспользует `resolve_source` из `userbot.py` — держите оба файла рядом.
 

@@ -28,9 +28,9 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.errors import (
     ChannelPrivateError,
     FloodWaitError,
@@ -51,9 +51,12 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
-# Источник: @username, https://t.me/+хеш, https://t.me/c/1916432895/1 или -100...
-SOURCE = os.getenv("SOURCE", "").strip()
-# Куда репостить: @username вашего канала или -100...
+# Источники — сколько угодно, через запятую или с новой строки. Каждый может быть
+# @username, https://t.me/+хеш, https://t.me/c/1916432895/1 или -100...
+# По умолчанию всё летит в TARGET; своя цель для источника пишется через "=>":
+#     SOURCES="@news, @sport => @my_sport, https://t.me/+хеш"
+SOURCES = os.getenv("SOURCES", "") or os.getenv("SOURCE", "")
+# Куда репостить по умолчанию: @username вашего канала или -100...
 TARGET = os.getenv("TARGET", "").strip()
 
 # Пауза перед отправкой копии, сек. Не ставьте 0 — мгновенные реакции выглядят
@@ -62,6 +65,10 @@ SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 ALBUM_WAIT = 2.0                      # сколько ждём остальные части альбома
 
 STATE_FILE = Path(__file__).resolve().parent / "userbot_state.json"
+
+# Публикуем строго по одному посту за раз, даже когда источников много:
+# иначе несколько каналов разом упрутся в лимит Telegram на отправку.
+send_lock = asyncio.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,20 +85,54 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 # --------------------------------------------------------------------------- #
 
 
-def load_last_id() -> int:
-    """Последний скопированный ID — чтобы после рестарта догнать пропущенное."""
-    if STATE_FILE.exists():
-        try:
-            return int(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("last_id", 0))
-        except (ValueError, OSError):
-            log.error("Не читается %s, начинаю с нуля", STATE_FILE.name)
-    return 0
+def load_state(path: Path) -> Dict[str, int]:
+    """
+    Последний скопированный ID по каждому источнику: {"<chat_id>": 17544}.
+    Старый формат с единственным {"last_id": N} читается как есть — при первом
+    же сохранении файл переедет на новую схему.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        log.error("Не читается %s, начинаю с нуля", path.name)
+        return {}
+    if "last_id" in raw:                       # состояние от версии с одним источником
+        return {"_legacy": int(raw["last_id"])}
+    return {str(k): int(v) for k, v in raw.items()}
 
 
-def save_last_id(value: int) -> None:
-    tmp = STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"last_id": value}), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+def get_last_id(path: Path, chat_id: int) -> int:
+    state = load_state(path)
+    return state.get(str(chat_id), state.get("_legacy", 0))
+
+
+def save_last_id(path: Path, chat_id: int, value: int) -> None:
+    state = load_state(path)
+    state.pop("_legacy", None)                 # мигрируем на схему по каналам
+    state[str(chat_id)] = value
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def parse_sources(raw: str, default_target: str) -> List[Tuple[str, str]]:
+    """
+    Разбирает список источников в пары (ссылка, целевой канал).
+    Разделители — запятая и перенос строки, своя цель задаётся через "=>".
+    """
+    pairs: List[Tuple[str, str]] = []
+    for chunk in raw.replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=>" in chunk:
+            src, _, dst = chunk.partition("=>")
+            pairs.append((src.strip(), dst.strip()))
+        else:
+            pairs.append((chunk, default_target))
+    return pairs
 
 
 # --------------------------------------------------------------------------- #
@@ -177,17 +218,24 @@ async def copy_messages(client: TelegramClient, target, messages: List[Message])
     messages = [m for m in messages if m is not None]
     if not messages:
         return
-
-    await asyncio.sleep(SEND_DELAY)      # имитируем живую задержку
     first = messages[0]
 
+    # очередь на отправку общая для всех источников
+    async with send_lock:
+        await asyncio.sleep(SEND_DELAY)  # имитируем живую задержку
+        return await _do_copy(client, target, messages, first)
+
+
+async def _do_copy(client: TelegramClient, target, messages: List[Message],
+                   first: Message) -> None:
+    """Сама отправка — вызывается уже под send_lock."""
     try:
         if len(messages) > 1:
             # альбом: files и caption должны быть одной длины, иначе подписи
             # съедут на соседние картинки
             with_media = [m for m in messages if m.media]
             if not with_media:
-                return await copy_messages(client, target, messages[:1])
+                return await _do_copy(client, target, messages[:1], first)
             files = [m.media for m in with_media]
             captions = [m.text or "" for m in with_media]
             await client.send_file(target, files, caption=captions)
@@ -204,27 +252,28 @@ async def copy_messages(client: TelegramClient, target, messages: List[Message])
     except FloodWaitError as err:
         log.warning("FloodWait: жду %s сек", err.seconds)
         await asyncio.sleep(err.seconds + 1)
-        return await copy_messages(client, target, messages)
+        return await _do_copy(client, target, messages, first)
     except Exception as err:
         log.error("Не удалось скопировать %s: %s", [m.id for m in messages], err)
         return
 
-    last = max(m.id for m in messages)
-    save_last_id(last)
-    log.info("Скопировано: %s", [m.id for m in messages])
+    save_last_id(STATE_FILE, first.chat_id, max(m.id for m in messages))
+    log.info("Скопировано из %s: %s", first.chat_id, [m.id for m in messages])
 
 
 async def catch_up(client: TelegramClient, source, target) -> None:
     """Досылает посты, вышедшие пока userbot был выключен."""
-    last_id = load_last_id()
+    last_id = get_last_id(STATE_FILE, utils.get_peer_id(source))
     if not last_id:
-        log.info("Состояния нет — копирую только новые посты")
+        log.info("Состояния по %s нет — копирую только новые посты",
+                 getattr(source, "title", utils.get_peer_id(source)))
         return
 
     missed = [m async for m in client.iter_messages(source, min_id=last_id, limit=50)]
     if not missed:
         return
-    log.info("Догоняю %s пропущенных постов", len(missed))
+    log.info("Догоняю %s пропущенных постов из %s",
+             len(missed), getattr(source, "title", utils.get_peer_id(source)))
 
     # группируем альбомы обратно и идём от старых к новым
     groups: dict = {}
@@ -265,10 +314,10 @@ async def interactive_login() -> None:
 
 
 async def run() -> None:
-    """Основной режим: слушаем источник и копируем всё новое."""
+    """Основной режим: слушаем все источники и копируем всё новое."""
     for name, value in (("API_ID", API_ID), ("API_HASH", API_HASH),
                         ("SESSION_STRING", SESSION_STRING),
-                        ("SOURCE", SOURCE), ("TARGET", TARGET)):
+                        ("SOURCES", SOURCES), ("TARGET", TARGET)):
         if not value:
             log.error("Не задана переменная окружения %s", name)
             sys.exit(1)
@@ -279,30 +328,50 @@ async def run() -> None:
     me = await client.get_me()
     log.info("Аккаунт: %s (@%s)", me.first_name, me.username or me.id)
 
-    try:
-        source = await resolve_source(client, SOURCE)
-    except (RuntimeError, ChannelPrivateError, ValueError) as err:
-        log.error("Источник недоступен: %s", err)
+    # chat_id источника -> куда репостить его посты
+    routes: Dict[int, Any] = {}
+    sources: List[Any] = []
+    for ref, target_ref in parse_sources(SOURCES, TARGET):
+        try:
+            source = await resolve_source(client, ref)
+            target = await _entity_with_cache(
+                client,
+                int(target_ref) if target_ref.lstrip("-").isdigit() else target_ref)
+        except Exception as err:
+            # один недоступный источник не должен ронять остальные
+            log.error("Источник %s пропущен: %s", ref, err)
+            continue
+        # ключ — «помеченный» id (-100...), в таком же виде его отдаёт event.chat_id
+        routes[utils.get_peer_id(source)] = target
+        sources.append(source)
+        log.info("Маршрут: %s → %s",
+                 getattr(source, "title", source.id), getattr(target, "title", target))
+
+    if not sources:
+        log.error("Ни один источник не доступен — останавливаюсь")
         await client.disconnect()
         sys.exit(1)
+    log.info("Источников подключено: %s", len(sources))
 
-    target = await client.get_entity(int(TARGET) if TARGET.lstrip("-").isdigit() else TARGET)
-    log.info("Репостинг: %s → %s",
-             getattr(source, "title", source), getattr(target, "title", target))
-
-    @client.on(events.Album(chats=source))
+    @client.on(events.Album(chats=sources))
     async def on_album(event: events.Album.Event) -> None:
         """Альбом приходит одним событием — отправляем его целиком."""
-        await copy_messages(client, target, list(event.messages))
+        target = routes.get(event.chat_id)
+        if target is not None:
+            await copy_messages(client, target, list(event.messages))
 
-    @client.on(events.NewMessage(chats=source))
+    @client.on(events.NewMessage(chats=sources))
     async def on_message(event: events.NewMessage.Event) -> None:
         """Одиночный пост. Части альбомов пропускаем — их заберёт on_album."""
         if event.message.grouped_id:
             return
-        await copy_messages(client, target, [event.message])
+        target = routes.get(event.chat_id)
+        if target is not None:
+            await copy_messages(client, target, [event.message])
 
-    await catch_up(client, source, target)
+    for source in sources:
+        await catch_up(client, source, routes[utils.get_peer_id(source)])
+
     log.info("Слушаю новые посты. Остановить — Ctrl+C")
     await client.run_until_disconnected()
 
