@@ -40,7 +40,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import Message
 
 # --------------------------------------------------------------------------- #
@@ -99,6 +99,22 @@ def save_last_id(value: int) -> None:
 # --------------------------------------------------------------------------- #
 
 
+async def _entity_with_cache(client: TelegramClient, ref):
+    """
+    Достаёт entity, при необходимости прогрев кэш диалогов.
+
+    У свежей SESSION_STRING кэш пустой, и приватный канал по числовому ID
+    не находится («Could not find the input entity»), даже если аккаунт в нём
+    состоит. Один проход по диалогам это чинит.
+    """
+    try:
+        return await client.get_entity(ref)
+    except ValueError:
+        log.info("Канала нет в кэше сессии — читаю список диалогов")
+        await client.get_dialogs()
+        return await client.get_entity(ref)
+
+
 async def resolve_source(client: TelegramClient, ref: str):
     """
     Находит канал-источник и при необходимости вступает в него.
@@ -115,8 +131,14 @@ async def resolve_source(client: TelegramClient, ref: str):
                 log.info("Вступил в канал по приглашению")
                 return updates.chats[0]
             except UserAlreadyParticipantError:
+                # аккаунт уже в канале — забираем его через проверку приглашения,
+                # это надёжнее, чем резолвить саму ссылку
                 log.info("Аккаунт уже состоит в этом канале")
-                return await client.get_entity(ref)
+                invite = await client(CheckChatInviteRequest(invite_hash))
+                chat = getattr(invite, "chat", None)
+                if chat is not None:
+                    return chat
+                return await _entity_with_cache(client, ref)
             except InviteHashExpiredError:
                 raise RuntimeError("Ссылка-приглашение просрочена или отозвана")
             except FloodWaitError as err:
@@ -126,7 +148,8 @@ async def resolve_source(client: TelegramClient, ref: str):
     if "t.me/c/" in ref:
         ref = "-100" + ref.split("t.me/c/", 1)[1].split("/")[0]
 
-    entity = await client.get_entity(int(ref) if ref.lstrip("-").isdigit() else ref)
+    entity = await _entity_with_cache(
+        client, int(ref) if ref.lstrip("-").isdigit() else ref)
 
     # в публичный канал вступаем явно, иначе не придут события о новых постах
     try:
