@@ -73,6 +73,8 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 SOURCES = os.getenv("SOURCES", "") or os.getenv("SOURCE", "")
 TARGET = os.getenv("TARGET", "").strip()   # цель по умолчанию
 
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) or None   # кому доверен мастер входа
+
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 ALBUM_WAIT = 2.0
 MAX_UPLOAD = 45 * 1024 * 1024        # лимит загрузки через Bot API ~50 МБ
@@ -445,15 +447,35 @@ async def check_targets(api: BotAPI, targets: List[str]) -> List[str]:
     return good
 
 
+async def get_session() -> str:
+    """
+    Достаёт SESSION_STRING: из переменной окружения, из ранее сохранённого файла
+    или — если ничего нет — проводит вход прямо в чате с ботом.
+    """
+    if SESSION_STRING:
+        return SESSION_STRING
+    # импорт отложенный: когда сессия уже есть, aiogram не нужен вовсе
+    from login_via_bot import read_saved_session, session_via_bot
+
+    saved = read_saved_session()
+    if saved:
+        log.info("Сессия взята из session.txt")
+        return saved
+    # на хостинге без терминала код из Telegram вводится прямо в чате с ботом
+    return await session_via_bot(BOT_TOKEN, API_ID, API_HASH, OWNER_ID)
+
+
 async def run() -> None:
+    # SESSION_STRING намеренно не в списке: если её нет, войдём через чат с ботом
     for name, value in (("BOT_TOKEN", BOT_TOKEN), ("API_ID", API_ID),
-                        ("API_HASH", API_HASH), ("SESSION_STRING", SESSION_STRING),
+                        ("API_HASH", API_HASH),
                         ("SOURCES", SOURCES), ("TARGET", TARGET)):
         if not value:
             log.error("Не задана переменная окружения %s", name)
             sys.exit(1)
 
     pairs = parse_sources(SOURCES, TARGET)
+    session_string = await get_session()
 
     async with aiohttp.ClientSession() as http:
         api = BotAPI(BOT_TOKEN, http)
@@ -462,7 +484,7 @@ async def run() -> None:
             log.error("Ни одного пригодного целевого канала — останавливаюсь")
             sys.exit(1)
 
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.start()
         me = await client.get_me()
         log.info("Читает аккаунт: %s (@%s)", me.first_name, me.username or me.id)

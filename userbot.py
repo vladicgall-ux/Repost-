@@ -64,6 +64,11 @@ TARGET = os.getenv("TARGET", "").strip()
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 ALBUM_WAIT = 2.0                      # сколько ждём остальные части альбома
 
+# токен бота нужен только для мастера входа без терминала (см. LOGIN_BOT_TOKEN
+# в README); на сам репостинг он не влияет — тут публикует аккаунт
+LOGIN_BOT_TOKEN = os.getenv("LOGIN_BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) or None
+
 STATE_FILE = Path(__file__).resolve().parent / "userbot_state.json"
 
 # Публикуем строго по одному посту за раз, даже когда источников много:
@@ -313,16 +318,38 @@ async def interactive_login() -> None:
         print("=" * 70 + "\n")
 
 
+async def get_session() -> str:
+    """
+    Достаёт SESSION_STRING: из переменной окружения, из сохранённого файла
+    или — если ничего нет и задан LOGIN_BOT_TOKEN — через чат с ботом.
+    """
+    if SESSION_STRING:
+        return SESSION_STRING
+    # импорт отложенный: когда сессия уже есть, aiogram не нужен вовсе
+    from login_via_bot import read_saved_session, session_via_bot
+
+    saved = read_saved_session()
+    if saved:
+        log.info("Сессия взята из session.txt")
+        return saved
+    if LOGIN_BOT_TOKEN:
+        return await session_via_bot(LOGIN_BOT_TOKEN, API_ID, API_HASH, OWNER_ID)
+    log.error("Нет SESSION_STRING. Либо получите её командой "
+              "`python userbot.py --login`, либо задайте LOGIN_BOT_TOKEN, "
+              "чтобы войти прямо в чате с ботом (нужно на хостинге без терминала)")
+    sys.exit(1)
+
+
 async def run() -> None:
     """Основной режим: слушаем все источники и копируем всё новое."""
     for name, value in (("API_ID", API_ID), ("API_HASH", API_HASH),
-                        ("SESSION_STRING", SESSION_STRING),
                         ("SOURCES", SOURCES), ("TARGET", TARGET)):
         if not value:
             log.error("Не задана переменная окружения %s", name)
             sys.exit(1)
 
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    session_string = await get_session()
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     await client.start()
 
     me = await client.get_me()
