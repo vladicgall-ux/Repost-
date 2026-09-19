@@ -9,3 +9,4 @@ state.json
 userbot_state.json
 *.session
 *.session-journal
+hybrid_state.json
