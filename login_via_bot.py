@@ -76,7 +76,7 @@ class Login(StatesGroup):
 def build_login_router(
     credentials: Callable[[], Tuple[int, str]],
     on_session: Callable[[str], Awaitable[None]],
-    allowed: Callable[[AioMessage], bool],
+    allowed: Callable[[AioMessage], Awaitable[bool]],
 ) -> Router:
     """
     Собирает роутер с мастером входа.
@@ -113,7 +113,7 @@ def build_login_router(
 
     @router.message(Command("login"))
     async def cmd_login(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         api_id, api_hash = credentials()
         if not (api_id and api_hash):
@@ -137,7 +137,7 @@ def build_login_router(
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         await state.clear()
         await drop_client()
@@ -145,7 +145,7 @@ def build_login_router(
 
     @router.message(Login.phone)
     async def step_phone(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         phone = re.sub(r"[^\d+]", "", message.text or "")
         if not re.fullmatch(r"\+?\d{7,15}", phone):
@@ -175,7 +175,7 @@ def build_login_router(
 
     @router.message(Login.code)
     async def step_code(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         code = re.sub(r"\D", "", message.text or "")
         if not code:
@@ -210,7 +210,7 @@ def build_login_router(
 
     @router.message(Login.password)
     async def step_password(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         client: TelegramClient = session["client"]
         try:
@@ -245,10 +245,14 @@ async def session_via_bot(bot_token: str, api_id: int, api_hash: str,
     done: asyncio.Future = asyncio.get_running_loop().create_future()
     owner = {"id": owner_id}
 
-    def allowed(message: "AioMessage") -> bool:
-        if owner["id"] is None and message.from_user:
+    async def allowed(message: "AioMessage") -> bool:
+        """Владелец один: кто первым написал, тот и управляет."""
+        if not message.from_user:
+            return False
+        if owner["id"] is None:
             owner["id"] = message.from_user.id
-        return message.from_user is not None and message.from_user.id == owner["id"]
+            log.info("Владелец бота: %s", owner["id"])
+        return message.from_user.id == owner["id"]
 
     async def on_session(value: str) -> None:
         if not done.done():

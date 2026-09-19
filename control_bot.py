@@ -117,15 +117,40 @@ def build_router(app: Any) -> Router:
     router = Router()      # команды
     fallback = Router()    # всё остальное: пересланные посты и ссылки
 
-    def allowed(message: AioMessage) -> bool:
-        """Управлять может только владелец; первый написавший им и становится."""
+    # кому из чужих уже объяснили, что бот занят — чтобы не отвечать на каждое
+    # их сообщение
+    refused: set = set()
+
+    async def allowed(message: AioMessage) -> bool:
+        """
+        Владелец у бота один: им становится тот, кто первым написал.
+        Дальше все чужие сообщения отклоняются, сменить владельца нельзя.
+        """
         if not message.from_user:
             return False
-        if app.cfg.get("owner_id") is None:
-            app.cfg["owner_id"] = message.from_user.id
+        user_id = message.from_user.id
+        owner_id = app.cfg.get("owner_id")
+
+        if owner_id is None:
+            app.cfg["owner_id"] = user_id
             app.save()
-            log.info("Владелец бота: %s", message.from_user.id)
-        return message.from_user.id == app.cfg.get("owner_id")
+            log.info("Владелец бота: %s (%s)", user_id, message.from_user.full_name)
+            await message.answer(
+                "👑 <b>Вы владелец этого бота.</b>\n"
+                "Управлять им больше никто не сможет.\n"
+            )
+            return True
+
+        if user_id == owner_id:
+            return True
+
+        # чужой: отвечаем один раз и больше не реагируем
+        log.warning("Чужой пользователь %s (%s) — отказано",
+                    user_id, message.from_user.full_name)
+        if user_id not in refused:
+            refused.add(user_id)
+            await message.answer("⛔️ У этого бота уже есть владелец.")
+        return False
 
     def next_step() -> str:
         """Подсказка, чего не хватает для запуска."""
@@ -149,7 +174,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(CommandStart())
     async def cmd_start(message: AioMessage) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         await message.answer(
             "👋 Я копирую посты из чужих каналов в ваш.\n\n"
@@ -159,7 +184,7 @@ def build_router(app: Any) -> Router:
             "/target @канал — куда публиковать\n\n"
             "<b>Источники:</b> перешлите мне пост из нужного канала.\n"
             "Нет доступа к каналу — пришлите ссылку <code>https://t.me/+…</code>\n\n"
-            "<b>Ещё:</b> /list, /remove номер, /status, /logout\n\n"
+            "<b>Ещё:</b> /list, /remove номер, /status, /owner, /logout\n\n"
             + next_step()
         )
 
@@ -167,7 +192,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Command("setup"))
     async def cmd_setup(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         await state.set_state(Setup.api_id)
         await message.answer(
@@ -182,7 +207,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Setup.api_id)
     async def step_api_id(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         value = (message.text or "").strip()
         if not value.isdigit():
@@ -195,7 +220,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Setup.api_hash)
     async def step_api_hash(message: AioMessage, state: FSMContext) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         value = (message.text or "").strip()
         if len(value) < 30:
@@ -214,7 +239,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Command("target"))
     async def cmd_target(message: AioMessage) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) < 2:
@@ -273,7 +298,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Command("list"))
     async def cmd_list(message: AioMessage) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         sources = load_sources()
         if not sources:
@@ -290,7 +315,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Command("remove"))
     async def cmd_remove(message: AioMessage) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         parts = (message.text or "").split()
         sources = load_sources()
@@ -314,7 +339,7 @@ def build_router(app: Any) -> Router:
 
     @router.message(Command("status"))
     async def cmd_status(message: AioMessage) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         sources = load_sources()
         active = sum(1 for s in sources if s.get("chat_id") in app.routes)
@@ -328,9 +353,20 @@ def build_router(app: Any) -> Router:
             f"<b>Репостинг:</b> {'🟢 работает' if app.running else '🔴 остановлен'}\n\n"
             + next_step())
 
+    @router.message(Command("owner"))
+    async def cmd_owner(message: AioMessage) -> None:
+        if not await allowed(message):
+            return
+        await message.answer(
+            f"👑 Владелец бота: <code>{app.cfg.get('owner_id')}</code> — это вы.\n\n"
+            "Сменить владельца нельзя. Если бот попал не в те руки, остановите его, "
+            "удалите <code>bot_config.json</code> и запустите заново — "
+            "владельцем станет тот, кто напишет первым."
+        )
+
     @router.message(Command("logout"))
     async def cmd_logout(message: AioMessage) -> None:
-        if not allowed(message):
+        if not await allowed(message):
             return
         await app.stop()
         forget_session()
@@ -339,7 +375,7 @@ def build_router(app: Any) -> Router:
     @fallback.message()
     async def on_any(message: AioMessage) -> None:
         """Пересланный пост или ссылка на канал — добавляем источник."""
-        if not allowed(message):
+        if not await allowed(message):
             return
         if app.client is None:
             await message.answer("Сначала войдите в аккаунт: /login\n\n" + next_step())
